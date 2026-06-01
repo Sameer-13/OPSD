@@ -2,6 +2,7 @@ import os
 import wandb
 
 from datasets import load_dataset
+from datasets import load_from_disk
 from transformers import AutoTokenizer, GenerationConfig
 
 from trl import (
@@ -263,7 +264,9 @@ if __name__ == "__main__":
     # Add presence_penalty to training_args so it can be accessed in the trainer
     training_args.presence_penalty = script_args.presence_penalty
 
-    dataset = load_dataset("siyanzhao/Openthoughts_math_30k_opsd")
+    dataset = load_from_disk("./legal_opsd_data")
+    # If load_from_disk returns a Dataset directly (not a DatasetDict), wrap it:
+    train_dataset = dataset if not hasattr(dataset, "keys") else dataset["train"]
     train_dataset = dataset["train"]
 
     trainer = OPSDTrainer(
