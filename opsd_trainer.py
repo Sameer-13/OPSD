@@ -370,6 +370,7 @@ class OPSDTrainer(SFTTrainer):
         required_columns = [
             "problem",
             "solution",
+            "verdict"
         ]
         if self._signature_columns is None:
             self._signature_columns = required_columns
