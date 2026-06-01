@@ -1,4 +1,5 @@
 import inspect
+
 import torch
 
 
@@ -47,20 +48,21 @@ class SelfDistillationDataCollator:
     """
     Data collator for OPSD self-distillation on Saudi legal cases.
 
-    Student: sees only the facts + relevant laws (no reference reasoning).
-    Teacher: sees the facts + relevant laws + the reference reasoning/verdict
-             as privileged context, then is asked to derive its own answer.
+    Student: sees only the facts + relevant laws (no reference reasoning, no verdict).
+    Teacher: sees the facts + relevant laws + reference reasoning + the
+             ground-truth verdict & classification as privileged context, then
+             is asked to derive its own answer in the required format.
 
-    To enable batch-level operations, prompts are padded to the same length
-    within each batch, and the actual (unpadded) prompt lengths are tracked
-    for accurate loss masking.
+    Giving the teacher the verdict explicitly (in addition to the reasoning)
+    makes OPSD closer to the paper's framing where `y*` is the ground-truth
+    answer — the teacher rationalizes a known-correct outcome and uses that
+    to provide dense supervision on the student's own rollout.
 
     Expected dataset columns:
-        - "problem":  string containing the facts and laws (built upstream
-                      from your case["facts"] and case["laws"]).
-        - "solution": string containing the gold reasoning + verdict +
-                      classification in the same three-tag format the model
-                      is expected to produce.
+        - "problem":  facts + relevant laws (built upstream)
+        - "solution": gold step-by-step reasoning, wrapped in <REASONING>...</REASONING>
+        - "verdict":  gold verdict summary + classification, wrapped in the
+                      <VERDICT> and <VERDICT_CLASSIFICATION> tags
     """
 
     def __init__(
@@ -78,37 +80,34 @@ class SelfDistillationDataCollator:
         self.teacher_thinking = teacher_thinking
 
         # Detect whether the tokenizer's chat template accepts `enable_thinking`
-        # (Qwen3 does; Gemma and most other model families do not). We avoid
-        # passing the kwarg if it's not supported, otherwise the template call
-        # raises.
+        # (Qwen3 does; Gemma and most other model families do not).
         try:
             sig = inspect.signature(self.tokenizer.apply_chat_template)
             self._supports_thinking_kwarg = "enable_thinking" in sig.parameters
         except (TypeError, ValueError):
             self._supports_thinking_kwarg = False
 
-        # Prompt for the teacher's "rationalize first" mode (reason_first=True).
-        # In this mode, the teacher first explains the reference reasoning,
-        # then is asked to produce its own answer.
+        # Teacher's rationalization preamble when reason_first=True.
         self.reason_first_prompt = (
-            "\n\nThe reference reasoning above arrives at the correct verdict. "
-            "Please analyze this reasoning and explain the key legal logic and "
-            "argumentative strategies employed by the court. "
+            "\n\nThe reference reasoning and verdict above represent the correct "
+            "outcome for this case. Please analyze the reasoning and explain the "
+            "key legal logic that led to this verdict. "
             "Do NOT derive your own verdict yet. "
-            "Simply analyze and explain the reference reasoning provided above.\n"
+            "Simply analyze and explain the reference materials provided above.\n"
         )
 
-        # Prompt used to transition the teacher from seeing the reference
-        # reasoning/verdict to producing its own answer in the required format.
+        # Transition prompt that hands the teacher from privileged context to
+        # generating its own answer.
         self.transition_prompt = (
-            "\n\nAfter reading the reference reasoning and verdict above, make "
-            "sure you truly understand the legal logic behind each step — do "
-            "not copy or paraphrase it. Now, using your own words and "
-            "independent legal analysis, produce the reasoning, verdict, and "
-            "classification for the case above in the required three-tag format.\n"
+            "\n\nAfter reading the reference reasoning and the ground-truth "
+            "verdict above, make sure you truly understand the legal logic "
+            "behind the ruling — do not copy or paraphrase it. Now, using your "
+            "own words and independent legal analysis, produce the reasoning, "
+            "verdict, and classification for the case above in the required "
+            "three-tag format. Your verdict and classification must agree with "
+            "the ground-truth outcome above.\n"
         )
 
-        # Force right padding for consistency with the trainer's slicing.
         print(f"[DataCollator] Original padding_side: {self.tokenizer.padding_side}")
         self.tokenizer.padding_side = "right"
         print(f"[DataCollator] Set padding_side to: {self.tokenizer.padding_side}")
@@ -116,12 +115,29 @@ class SelfDistillationDataCollator:
         print(f"[DataCollator] Chat template supports enable_thinking kwarg: {self._supports_thinking_kwarg}")
 
     def _apply_chat_template(self, messages, enable_thinking=None):
-        """Wrapper around apply_chat_template that only passes enable_thinking
-        when the underlying template supports it."""
+        """Apply chat template, passing enable_thinking only when supported."""
         kwargs = {"tokenize": False, "add_generation_prompt": True}
         if self._supports_thinking_kwarg and enable_thinking is not None:
             kwargs["enable_thinking"] = enable_thinking
         return self.tokenizer.apply_chat_template(messages, **kwargs)
+
+    def _build_privileged_block(self, solution, verdict):
+        """Assemble the privileged context block the teacher sees.
+
+        Lays out the gold reasoning and the gold verdict as two clearly
+        separated sub-blocks so the model treats them as distinct pieces of
+        privileged information.
+        """
+        return (
+            f"Here is the reference reasoning for this case:\n"
+            f"=== Reference Reasoning Begin ===\n"
+            f"{solution}\n"
+            f"=== Reference Reasoning End ===\n\n"
+            f"Here is the ground-truth verdict and classification for this case:\n"
+            f"=== Ground-Truth Verdict Begin ===\n"
+            f"{verdict}\n"
+            f"=== Ground-Truth Verdict End ==="
+        )
 
     def __call__(self, features):
         batch_size = len(features)
@@ -131,10 +147,9 @@ class SelfDistillationDataCollator:
         teacher_reasoning_prompts = []  # only used when reason_first=True
 
         for feature in features:
-            # `problem`  = facts + relevant laws (assembled upstream)
-            # `solution` = gold reasoning + verdict + classification
-            problem = feature["problem"]
-            solution = feature["solution"]
+            problem = feature["problem"]    # facts + laws
+            solution = feature["solution"]  # gold reasoning (in <REASONING> tags)
+            verdict = feature["verdict"]    # gold verdict + classification
 
             # ---- Student prompt: only facts + laws ----
             student_user_message = f"{problem}\n\nBegin!"
@@ -147,36 +162,25 @@ class SelfDistillationDataCollator:
             )
             student_prompts.append(student_prompt)
 
+            # ---- Teacher prompt: facts + laws + privileged context ----
+            privileged_block = self._build_privileged_block(solution, verdict)
+
             if self.reason_first:
-                # Teacher first rationalizes the reference reasoning out loud,
-                # THEN the transition prompt + own-answer prompt is appended.
+                # Teacher first rationalizes the privileged materials out loud.
                 reasoning_user_message = (
-                    f"{problem}\n\n"
-                    f"Here is the correct reasoning and verdict for this case:\n"
-                    f"=== Reference Reasoning Begin ===\n"
-                    f"{solution}\n"
-                    f"=== Reference Reasoning End ===\n\n"
-                    f"{self.reason_first_prompt}"
+                    f"{problem}\n\n{privileged_block}\n\n{self.reason_first_prompt}"
                 )
                 reasoning_messages = [
                     {"role": "system", "content": SYSTEM_PROMPT},
                     {"role": "user", "content": reasoning_user_message},
                 ]
-                # No enable_thinking here — reasoning-phase generation should
-                # always be plain (matches the original repo behavior).
                 reasoning_prompt = self._apply_chat_template(reasoning_messages)
                 teacher_reasoning_prompts.append(reasoning_prompt)
-
-                # Placeholder — the actual teacher prompt is built inside the
-                # trainer after the rationalization tokens have been generated.
-                teacher_prompts.append("")
+                teacher_prompts.append("")  # placeholder, built later in trainer
             else:
-                # Standard OPSD teacher prompt: facts + laws + reference
-                # reasoning/verdict + transition to producing its own answer.
                 teacher_user_message = (
                     f"{problem}\n\n"
-                    f"Here is a reference reasoning and verdict for this case:\n"
-                    f"=== Reference Begin ===\n{solution}\n=== Reference End ===\n"
+                    f"{privileged_block}\n"
                     f"{self.transition_prompt}\n"
                     f"Begin!"
                 )
@@ -190,7 +194,6 @@ class SelfDistillationDataCollator:
                 teacher_prompts.append(teacher_prompt)
 
         # ---- Tokenize student prompts ----
-        # First pass without padding to recover true per-example lengths.
         student_encoded_no_pad = self.tokenizer(
             student_prompts,
             padding=False,
@@ -200,7 +203,6 @@ class SelfDistillationDataCollator:
         student_prompt_lengths = [len(ids) for ids in student_encoded_no_pad["input_ids"]]
         max_student_prompt_len = max(student_prompt_lengths)
 
-        # Second pass with padding to the batch max for stackable tensors.
         student_encoded = self.tokenizer(
             student_prompts,
             padding="max_length",
@@ -217,7 +219,6 @@ class SelfDistillationDataCollator:
         }
 
         if self.reason_first:
-            # ---- Tokenize the reasoning-phase teacher prompts ----
             reasoning_encoded_no_pad = self.tokenizer(
                 teacher_reasoning_prompts,
                 padding=False,
@@ -235,8 +236,6 @@ class SelfDistillationDataCollator:
                 return_tensors="pt",
             )
 
-            # Transition text gets appended after the teacher's rationalization
-            # tokens, then the model is asked to produce its own answer.
             transition_text = (
                 f"\n{self.transition_prompt}\n"
                 f"Now produce the reasoning, verdict, and classification in "
@@ -258,7 +257,6 @@ class SelfDistillationDataCollator:
                 }
             )
         else:
-            # ---- Tokenize the standard teacher prompts ----
             teacher_encoded_no_pad = self.tokenizer(
                 teacher_prompts,
                 padding=False,
